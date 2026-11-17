@@ -1,0 +1,407 @@
+# fw23 build: RetroArch + libretro cores for Nintendo Switch firmware 23.
+#
+# The official libnx image (v4-10-0) predates the fw23 userspace changes.
+# This workflow installs libnx master (which carries the 23.0.0 kernel and
+# service updates), builds the dummy frontend once, compiles the frontend
+# objects once more for real cores, builds the core archives with
+# libretro-super's buildbot script, then statically links one NRO per core,
+# mirroring dist-scripts/dist-cores.sh.
+name: Build fw23 (libnx master)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '**'
+      - '!samples/**'
+      - '!libretro-common/samples/**'
+      - '!.github/workflows/*.yml'
+      - '.github/workflows/fw23-build.yml'
+  pull_request:
+    paths:
+      - '**'
+      - '!samples/**'
+      - '!libretro-common/samples/**'
+      - '!.github/workflows/*.yml'
+      - '.github/workflows/fw23-build.yml'
+  workflow_dispatch:
+    inputs:
+      libnx_ref:
+        description: 'libnx git ref to build against (commit, tag or branch)'
+        default: 'b156b4774fb2df7b93402169509266da7547fc4c'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fw23-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # svc/spl: update types for 23.0.0
+  FW23_LIBNX_COMMIT: d8d0bf261b01483e8c38deb1188cf5727bce5d1a
+  # libnx master HEAD; v4.12.0 does not carry the fw23 commit.
+  LIBNX_REF: ${{ inputs.libnx_ref || 'b156b4774fb2df7b93402169509266da7547fc4c' }}
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: reallibretroretroarch/libretro-build-libnx-devkitpro:v4-10-0
+      options: --user root --dns 1.1.1.1 --dns 8.8.8.8
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Restore ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: .ccache
+        key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ github.workflow }}-${{ github.job }}-
+
+    - name: Set up ccache
+      run: |
+        command -v ccache > /dev/null || {
+          for i in 1 2 3; do
+            timeout 90 apt-get -yq update \
+              -o Acquire::Retries=3 -o Acquire::http::Timeout=30 &&
+            timeout 120 apt-get -yq install --no-install-recommends \
+              ccache > /dev/null && break
+            echo "installing ccache failed (attempt $i); retrying in 10s"
+            sleep 10
+          done
+        }
+        echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=250M" >> "$GITHUB_ENV"
+        if command -v ccache > /dev/null; then
+          CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" ccache -z
+        fi
+
+    - name: Toolchain info
+      run: |
+        export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+        export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/libnx/bin:$DEVKITPRO/portlibs/switch/bin:$PATH"
+        echo "DEVKITPRO=$DEVKITPRO"
+        aarch64-none-elf-gcc --version | head -n1
+        aarch64-none-elf-ar --version | head -n1
+        elf2nro --version 2>/dev/null || true
+        echo "nproc=$(nproc)"
+
+    - name: Install libnx (fw23)
+      run: |
+        set -e
+        export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+        git clone https://github.com/switchbrew/libnx.git
+        cd libnx
+        git checkout "${LIBNX_REF}"
+        git log --oneline -1
+        if git merge-base --is-ancestor "$FW23_LIBNX_COMMIT" HEAD; then
+          echo "fw23 commit $FW23_LIBNX_COMMIT present"
+        else
+          echo "fw23 commit $FW23_LIBNX_COMMIT missing from $LIBNX_REF"
+          exit 1
+        fi
+        make -j"$(nproc)"
+        make install
+
+    - name: Build dummy frontend
+      run: |
+        bash .github/workflows/scripts/ccache-make.sh \
+          -f Makefile.libnx -j"$(nproc)" HAVE_STATIC_DUMMY=1
+        mkdir -p out/switch
+        mv -f retroarch_switch.nro out/switch/
+        make -f Makefile.libnx clean
+
+    - name: Build per-core objects
+      # Objects without HAVE_STATIC_DUMMY, the set every per-core NRO
+      # relinks against. An empty placeholder archive lets the build run
+      # to the (failing) link, after which only the objects matter.
+      run: |
+        set -e
+        export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+        export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/libnx/bin:$DEVKITPRO/portlibs/switch/bin:$PATH"
+        ar rcs libretro_libnx.a
+        bash .github/workflows/scripts/ccache-make.sh \
+          -f Makefile.libnx -j"$(nproc)" || true
+        echo "objects: $(find build -name '*.o' | wc -l)"
+
+    - name: ccache statistics
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      run: ccache -sv || ccache -s
+
+    - name: Save ccache
+      if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v4
+      with:
+        path: .ccache
+        key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+    - name: Stage assets
+      run: |
+        set -e
+        git clone --depth 1 -b master https://github.com/libretro/retroarch-assets.git media/assets
+        git clone --depth 1 -b master https://github.com/libretro/retroarch-joypad-autoconfig.git media/autoconfig
+        git clone --depth 1 -b master https://github.com/libretro/libretro-database.git media/libretrodb
+        git clone --depth 1 -b master https://github.com/libretro/common-overlays.git media/overlays
+        git clone --depth 1 -b master https://github.com/libretro/glsl-shaders.git media/shaders_glsl
+        mkdir -p out/switch out/retroarch/cores/system out/retroarch/cheats \
+                 out/retroarch/database/rdb out/retroarch/database/cursors \
+                 out/retroarch/filters out/retroarch/info out/retroarch/remaps
+        cp -rf media/assets/* out/retroarch/assets
+        cp -rf media/autoconfig/* out/retroarch/autoconfig
+        cp -rf media/libretrodb/rdb/* out/retroarch/database/rdb
+        cp -rf media/libretrodb/cursors/* out/retroarch/database/cursors
+        cp -rf media/overlays/* out/retroarch/overlays
+        cp -rf media/shaders_glsl/* out/retroarch/shaders
+        cp -f pkg/libnx/retroarch.jpg out/retroarch.jpg
+        cp -f gfx/video_filters/*.filt out/retroarch/filters
+        rm -rf out/retroarch/assets/src out/retroarch/assets/nuklear \
+               out/retroarch/assets/branding out/retroarch/assets/wallpapers \
+               out/retroarch/assets/zarch
+        touch out/retroarch/cheats/.empty out/retroarch/remaps/.empty
+        echo "assets staged: $(find out -type f | wc -l) files"
+
+    - name: Upload build dir (objects)
+      uses: actions/upload-artifact@v4
+      with:
+        name: fw23-build
+        path: |
+          build/
+          libretro_libnx.a
+
+    - name: Upload frontend + assets
+      uses: actions/upload-artifact@v4
+      with:
+        name: fw23-frontend
+        path: out
+
+  cores:
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: [1, 2, 3]
+    env:
+      BATCH: ${{ matrix.batch }}
+    container:
+      image: reallibretroretroarch/libretro-build-libnx-devkitpro:v4-10-0
+      options: --user root --dns 1.1.1.1 --dns 8.8.8.8
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download object files
+      uses: actions/download-artifact@v4
+      with:
+        name: fw23-build
+        path: .
+
+    - name: Install libnx (fw23)
+      run: |
+        set -e
+        export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+        git clone https://github.com/switchbrew/libnx.git
+        cd libnx
+        git checkout "${LIBNX_REF}"
+        git log --oneline -1
+        make -j"$(nproc)"
+        make install
+
+    - name: Prepare batch recipe
+      run: |
+        set -e
+        total=$(grep -c '^[^[:space:]]' cores-libnx-fw23.txt)
+        n=$(( (total + 2) / 3 ))
+        start=$(( (BATCH - 1) * n + 1 ))
+        end=$(( BATCH * n ))
+        if [ "$end" -gt "$total" ]; then end=$total; fi
+        sed -n "${start},${end}p" cores-libnx-fw23.txt > recipes-batch
+        cat > recipes-batch.conf <<EOF
+        PATH /opt/devkitpro/portlibs/switch
+        platform libnx
+        PLATFORM libnx
+        DEVKITPRO /opt/devkitpro
+        PORTLIBS_PREFIX /opt/devkitpro/portlibs/switch
+        TOOL_PREFIX aarch64-none-elf-
+        RA NO
+        JOBS $(nproc)
+        CORE_JOB YES
+        MAKE make
+        CMAKE cmake
+        EOF
+        echo "batch $BATCH of 3: cores $start-$end of $total ($(wc -l < recipes-batch) entries)"
+
+    - name: Build batch cores
+      run: |
+        set -x
+        git clone --depth 1 https://github.com/libretro/libretro-super.git
+        cp recipes-batch "libretro-super/recipes/nintendo/fw23-batch$BATCH"
+        cp recipes-batch.conf "libretro-super/recipes/nintendo/fw23-batch$BATCH.conf"
+        cd libretro-super
+        BOT=fw23 LOGDATE="$(date +%Y%m%d)" FORCE=YES \
+          bash ./libretro-buildbot-recipe.sh "recipes/nintendo/fw23-batch$BATCH" "fw23b$BATCH"
+        ls -la dist/libnx/
+
+    - name: Relink per-core NROs
+      run: |
+        set -e
+        export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+        export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/libnx/bin:$DEVKITPRO/portlibs/switch/bin:$PATH"
+        # The checkout is newer than the restored objects; refresh them so
+        # make relinks instead of recompiling.
+        find build \( -name '*.o' -o -name '*.d' \) -exec touch {} +
+        mkdir -p out/cores out/info
+        # Report cores whose build produced no archive.
+        while read -r name _; do
+          if [ ! -f "libretro-super/dist/libnx/${name}_libretro_libnx.a" ]; then
+            echo "CORE BUILD FAILED: $name" | tee -a out/core-failures.txt
+          fi
+        done < recipes-batch
+        for f in $(ls -v libretro-super/dist/libnx/*_libretro_libnx.a 2>/dev/null); do
+          base=$(basename "$f")
+          name="${base%_libretro_libnx.a}"
+          echo "== [$name] relink =="
+          cp -f "$f" libretro_libnx.a
+          rm -f retroarch_switch.elf retroarch_switch.nacp \
+                retroarch_switch.nso retroarch_switch.pfs0
+          extra=
+          if [ "$name" = "nxengine" ]; then
+            extra="WHOLE_ARCHIVE_LINK=1"
+          fi
+          if [ "$name" = "tyrquake" ]; then
+            extra="BIG_STACK=1"
+          fi
+          if make -f Makefile.libnx APP_TITLE="$name" $extra -j"$(nproc)" \
+               > "out/link-$name.log" 2>&1; then
+            mv -f retroarch_switch.nro "out/cores/${name}_libretro_libnx.nro"
+            echo "== [$name] OK =="
+          else
+            echo "RELINK FAILED: $name" | tee -a out/core-failures.txt
+            tail -n 30 "out/link-$name.log" | tee -a out/core-failures.txt
+          fi
+        done
+        echo "NROs: $(ls out/cores | wc -l)"
+        # .info files for the core list, straight from the core repos.
+        while read -r name dir _; do
+          [ -f "libretro-super/dist/libnx/${name}_libretro_libnx.a" ] || continue
+          info=$(find "libretro-super/$dir" -maxdepth 2 -name libretro.info 2>/dev/null | head -n1)
+          if [ -n "$info" ]; then
+            cp -f "$info" "out/info/${name}_libretro.info"
+          fi
+        done < recipes-batch
+        touch out/info/core_info.refresh
+
+    - name: Upload batch cores
+      uses: actions/upload-artifact@v4
+      with:
+        name: fw23-cores-batch-${{ matrix.batch }}
+        path: out
+
+  bundle:
+    # Runs even when a batch job dies, so one flaky batch does not
+    # strand the rest of the build; missing batches are reported in
+    # core-build-failures.txt.
+    if: ${{ always() && !cancelled() && needs.frontend.result == 'success' }}
+    needs: [frontend, cores]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download frontend
+      uses: actions/download-artifact@v4
+      with:
+        name: fw23-frontend
+        path: stage/ra
+
+    - name: Download core batch 1
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: fw23-cores-batch-1
+        path: stage/cores1
+
+    - name: Download core batch 2
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: fw23-cores-batch-2
+        path: stage/cores2
+
+    - name: Download core batch 3
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: fw23-cores-batch-3
+        path: stage/cores3
+
+    - name: Assemble bundle
+      run: |
+        set -e
+        # Archive root layout, like the official RetroArch.7z:
+        # switch/retroarch_switch.nro, retroarch/..., retroarch.jpg
+        root=dist/stage
+        mkdir -p "$root/switch" "$root/retroarch/cores"
+        cp -f stage/ra/switch/retroarch_switch.nro "$root/switch/"
+        cp -rf stage/ra/retroarch/. "$root/retroarch/"
+        cp -f stage/ra/retroarch.jpg "$root/"
+        : > "$root/core-build-failures.txt"
+        for i in 1 2 3; do
+          if [ -d "stage/cores$i/cores" ]; then
+            cp -f "stage/cores$i/cores/"*.nro "$root/retroarch/cores/" || true
+            cp -f "stage/cores$i/info/"*.info "$root/retroarch/info/" 2>/dev/null || true
+            cat "stage/cores$i/core-failures.txt" >> "$root/core-build-failures.txt" 2>/dev/null || true
+          else
+            echo "CORE BATCH $i MISSING (job or upload failed)" \
+              >> "$root/core-build-failures.txt"
+          fi
+        done
+        n=$(ls "$root/retroarch/cores"/*.nro 2>/dev/null | wc -l)
+        {
+          echo "RetroArch fw23 build"
+          echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "retroarch commit: $(git rev-parse HEAD)"
+          echo "libnx ref: ${LIBNX_REF}"
+          echo "core NROs: $n"
+          echo ""
+          echo "Extract everything to the SD card root. The dummy frontend"
+          echo "is switch/retroarch_switch.nro (title takeover via a mod"
+          echo "loader), per-core NROs live in retroarch/cores/."
+          echo "See core-build-failures.txt for cores that could not be built."
+        } > "$root/BUILD-INFO.txt"
+        echo "core NROs: $n"
+
+    - name: Package
+      run: |
+        set -e
+        sudo apt-get -yq update -o Acquire::Retries=3
+        sudo apt-get -yq install --no-install-recommends p7zip-full
+        tag="RetroArch-fw23-$(date -u +%Y%m%d)-${GITHUB_SHA::8}"
+        # Frontend + assets only (no per-core NROs), for quick tests.
+        (cd dist/stage && \
+          zip -qr "../../$tag-frontend.zip" switch retroarch retroarch.jpg BUILD-INFO.txt \
+            -x 'retroarch/cores/*' 'retroarch/info/*')
+        # Everything in one 7z, like the official RetroArch.7z bundles.
+        (cd dist/stage && \
+          7z a -mmt=on -mx6 "$GITHUB_WORKSPACE/$tag.7z" \
+            switch retroarch retroarch.jpg BUILD-INFO.txt core-build-failures.txt > /dev/null)
+        ls -la "$GITHUB_WORKSPACE/$tag.7z" "$GITHUB_WORKSPACE/$tag-frontend.zip"
+
+    - name: Upload bundle
+      uses: actions/upload-artifact@v4
+      with:
+        name: RetroArch-fw23-bundle
+        path: RetroArch-fw23-*.7z
+
+    - name: Upload frontend
+      uses: actions/upload-artifact@v4
+      with:
+        name: RetroArch-fw23-frontend
+        path: RetroArch-fw23-*-frontend.zip

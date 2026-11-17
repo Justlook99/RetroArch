@@ -127,8 +127,10 @@ INCLUDES :=	include
 EXEFS_SRC := exefs_src
 #ROMFS := switch/romfs
 
-APP_TITLE := RetroArch
-APP_VERSION := $(RARCH_VERSION)
+APP_TITLE := RetroArch fw23
+# RARCH_VERSION is only defined by configure; on this platform use
+# version.all directly so the NACP carries the real version.
+APP_VERSION := $(PACKAGE_VERSION)
 APP_AUTHOR := libretro Team
 APP_ICON := pkg/libnx/retroarch.jpg
 
