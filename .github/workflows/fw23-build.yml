@@ -151,7 +151,9 @@ jobs:
         git clone --depth 1 -b master https://github.com/libretro/glsl-shaders.git media/shaders_glsl
         mkdir -p out/switch out/retroarch/cores/system out/retroarch/cheats \
                  out/retroarch/database/rdb out/retroarch/database/cursors \
-                 out/retroarch/filters out/retroarch/info out/retroarch/remaps
+                 out/retroarch/filters out/retroarch/info out/retroarch/remaps \
+                 out/retroarch/assets out/retroarch/autoconfig \
+                 out/retroarch/overlays out/retroarch/shaders
         cp -rf media/assets/* out/retroarch/assets
         cp -rf media/autoconfig/* out/retroarch/autoconfig
         cp -rf media/libretrodb/rdb/* out/retroarch/database/rdb
