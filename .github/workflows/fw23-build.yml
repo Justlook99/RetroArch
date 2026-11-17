@@ -120,6 +120,7 @@ jobs:
       # Objects without HAVE_STATIC_DUMMY, the set every per-core NRO
       # relinks against. An empty placeholder archive lets the build run
       # to the (failing) link, after which only the objects matter.
+      # libnx switch_rules build .o/.d into the source tree, not build/.
       run: |
         set -e
         export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
@@ -127,7 +128,7 @@ jobs:
         ar rcs libretro_libnx.a
         bash .github/workflows/scripts/ccache-make.sh \
           -f Makefile.libnx -j"$(nproc)" || true
-        echo "objects: $(find build -name '*.o' | wc -l)"
+        echo "objects: $(find . -name '*.o' | wc -l)"
 
     - name: ccache statistics
       if: ${{ !cancelled() }}
@@ -168,12 +169,15 @@ jobs:
         touch out/retroarch/cheats/.empty out/retroarch/remaps/.empty
         echo "assets staged: $(find out -type f | wc -l) files"
 
-    - name: Upload build dir (objects)
+    - name: Upload objects
       uses: actions/upload-artifact@v4
       with:
         name: fw23-build
         path: |
-          build/
+          *.o
+          *.d
+          **/*.o
+          **/*.d
           libretro_libnx.a
 
     - name: Upload frontend + assets
@@ -257,8 +261,10 @@ jobs:
         export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
         export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/libnx/bin:$DEVKITPRO/portlibs/switch/bin:$PATH"
         # The checkout is newer than the restored objects; refresh them so
-        # make relinks instead of recompiling.
-        find build \( -name '*.o' -o -name '*.d' \) -exec touch {} +
+        # make relinks instead of recompiling. Objects live in the source
+        # tree (libnx switch_rules), not build/.
+        find . \( -name '*.o' -o -name '*.d' \) \
+          -not -path './libretro-super/*' -not -path './.git/*' -exec touch {} +
         mkdir -p out/cores out/info
         # Report cores whose build produced no archive.
         while read -r name _; do
