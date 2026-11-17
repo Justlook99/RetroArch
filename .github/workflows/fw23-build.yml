@@ -179,6 +179,8 @@ jobs:
           **/*.o
           **/*.d
           libretro_libnx.a
+          !libnx/**
+          !media/**
 
     - name: Upload frontend + assets
       uses: actions/upload-artifact@v4
@@ -189,7 +191,7 @@ jobs:
   cores:
     needs: frontend
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 480
     strategy:
       fail-fast: false
       matrix:
@@ -213,6 +215,9 @@ jobs:
       run: |
         set -e
         export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+        # Objects of the frontend job's libnx build may be in the
+        # downloaded artifact; they are useless here and would block the clone.
+        rm -rf libnx
         git clone https://github.com/switchbrew/libnx.git
         cd libnx
         git checkout "${LIBNX_REF}"
